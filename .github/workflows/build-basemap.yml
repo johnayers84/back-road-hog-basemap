@@ -1,0 +1,131 @@
+name: Build Texas basemap
+
+on:
+  schedule:
+    - cron: "17 9 3 * *" # monthly, 3rd of the month 09:17 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if a release for the newest Protomaps build exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: basemap
+  cancel-in-progress: false
+
+env:
+  PMTILES_VERSION: "1.31.2"
+  PMTILES_SHA256: "3ed7dbf4ec2e6dfe5e25b6f70d1ffc932729f93c86db353bf514dd71010a312f"
+  STYLE_MAJOR: "4" # must match the @protomaps/basemaps major version bundled in the app
+  MAXZOOM: "15"
+  KEEP_RELEASES: "3"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pmtiles CLI
+        run: |
+          curl -fsSL -o pmtiles.tgz \
+            "https://github.com/protomaps/go-pmtiles/releases/download/v${PMTILES_VERSION}/go-pmtiles_${PMTILES_VERSION}_Linux_x86_64.tar.gz"
+          echo "${PMTILES_SHA256}  pmtiles.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin" && tar -xzf pmtiles.tgz -C "$RUNNER_TEMP/bin" pmtiles
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Select newest Protomaps v${{ env.STYLE_MAJOR }} build
+        id: select
+        run: |
+          curl -fsSL --retry 3 -o builds.json https://build-metadata.protomaps.dev/builds.json
+          read -r key version uploaded < <(python3 scripts/select_build.py "$STYLE_MAJOR" builds.json)
+          date="${key%.pmtiles}"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "uploaded=$uploaded" >> "$GITHUB_OUTPUT"
+          echo "tag=texas-$date" >> "$GITHUB_OUTPUT"
+          echo "Selected $key (tiles $version, uploaded $uploaded)"
+
+      - name: Skip if already published
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.select.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1 && [ "${{ inputs.force }}" != "true" ]; then
+            echo "Release $TAG already exists; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract Texas
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          KEY: ${{ steps.select.outputs.key }}
+        run: |
+          pmtiles extract "https://build.protomaps.com/$KEY" texas.pmtiles \
+            --region=regions/texas.geojson --maxzoom="$MAXZOOM" --download-threads=4
+          pmtiles verify texas.pmtiles
+          pmtiles show texas.pmtiles
+
+      - name: Write manifest
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          KEY: ${{ steps.select.outputs.key }}
+          VERSION: ${{ steps.select.outputs.version }}
+          UPLOADED: ${{ steps.select.outputs.uploaded }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, datetime
+          h = hashlib.sha256()
+          with open("texas.pmtiles", "rb") as f:
+              for chunk in iter(lambda: f.read(1 << 20), b""):
+                  h.update(chunk)
+          manifest = {
+              "file": "texas.pmtiles",
+              "sha256": h.hexdigest(),
+              "size_bytes": os.path.getsize("texas.pmtiles"),
+              "maxzoom": int(os.environ["MAXZOOM"]),
+              "region": "regions/texas.geojson (Geofabrik texas.poly)",
+              "source_build": "https://build.protomaps.com/" + os.environ["KEY"],
+              "tiles_version": os.environ["VERSION"],
+              "source_uploaded": os.environ["UPLOADED"],
+              "pmtiles_cli": os.environ["PMTILES_VERSION"],
+              "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+              "attribution": "© OpenStreetMap contributors (ODbL); Protomaps",
+          }
+          json.dump(manifest, open("manifest.json", "w"), indent=2)
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Publish release
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.select.outputs.tag }}
+          KEY: ${{ steps.select.outputs.key }}
+          VERSION: ${{ steps.select.outputs.version }}
+        run: |
+          notes="Texas basemap cut from Protomaps build \`$KEY\` (tiles v$VERSION), maxzoom $MAXZOOM.
+
+          Map data © OpenStreetMap contributors, available under the Open Database License (ODbL). Basemap tiles by Protomaps."
+          gh release delete "$TAG" --yes --cleanup-tag >/dev/null 2>&1 || true
+          gh release create "$TAG" texas.pmtiles manifest.json --title "$TAG" --notes "$notes" --latest
+
+      - name: Prune old releases
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 100 --json tagName,createdAt \
+            -q 'map(select(.tagName | startswith("texas-"))) | sort_by(.createdAt) | reverse | .[(env.KEEP_RELEASES | tonumber):] | .[].tagName' |
+          while read -r tag; do
+            echo "Deleting old release $tag"
+            gh release delete "$tag" --yes --cleanup-tag
+          done
